@@ -1863,10 +1863,11 @@ const RATE_LIMIT_ENABLED = process.env.RATE_LIMIT_DISABLED !== '1';
 const RATE_WINDOW_MS = envInt('RATE_LIMIT_WINDOW_MS', 60_000);
 /** Requests allowed per IP per window, by route group. */
 const RATE_LIMITS = {
-  tmdb: envInt('RATE_LIMIT_TMDB', 120),
-  upstream: envInt('RATE_LIMIT_UPSTREAM', 60),
-  media: envInt('RATE_LIMIT_MEDIA', 1200),
-  api: envInt('RATE_LIMIT_API', 120),
+  tmdb: envInt('RATE_LIMIT_TMDB', 60),
+  upstream: envInt('RATE_LIMIT_UPSTREAM', 20),
+  media: envInt('RATE_LIMIT_MEDIA', 600),
+  api: envInt('RATE_LIMIT_API', 30),
+  page: envInt('RATE_LIMIT_PAGE', 30),
 };
 /** @type {Map<string, { start: number, count: number }>} */
 const rateBuckets = new Map();
@@ -1880,6 +1881,15 @@ const rateGroupFor = (pathname) => {
     return 'upstream';
   }
   if (pathname === '/rooms' || pathname === '/app' || pathname === '/app/') return 'api';
+  // Full page loads (SPA entry points). In-app navigation does not re-request
+  // these, so only crawlers and refresh-spammers hit this limit.
+  if (
+    pathname === '/search' ||
+    pathname === '/join' ||
+    /^\/(title|watch|p)\//.test(pathname)
+  ) {
+    return 'page';
+  }
   return null;
 };
 
