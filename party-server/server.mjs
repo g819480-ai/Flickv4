@@ -1854,6 +1854,86 @@ const serveApp = async (_req, res) => {
   }
 };
 
+// --- Per-IP rate limiting (fixed window, in-memory) ---------------------
+const envInt = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+};
+const RATE_LIMIT_ENABLED = process.env.RATE_LIMIT_DISABLED !== '1';
+const RATE_WINDOW_MS = envInt('RATE_LIMIT_WINDOW_MS', 60_000);
+/** Requests allowed per IP per window, by route group. */
+const RATE_LIMITS = {
+  tmdb: envInt('RATE_LIMIT_TMDB', 120),
+  upstream: envInt('RATE_LIMIT_UPSTREAM', 60),
+  media: envInt('RATE_LIMIT_MEDIA', 1200),
+  api: envInt('RATE_LIMIT_API', 120),
+};
+/** @type {Map<string, { start: number, count: number }>} */
+const rateBuckets = new Map();
+
+const rateGroupFor = (pathname) => {
+  if (pathname === '/tmdb' || pathname.startsWith('/tmdb/')) return 'tmdb';
+  if (pathname.startsWith('/media/')) return 'media';
+  if (
+    /^\/(extract|play|wyzie|vdrk|streamflix|videasy|subtitle)(\/|$)/.test(pathname)
+  ) {
+    return 'upstream';
+  }
+  if (pathname === '/rooms' || pathname === '/app' || pathname === '/app/') return 'api';
+  return null;
+};
+
+const clientIp = (req) => {
+  const real = req.headers['x-real-ip'];
+  if (typeof real === 'string' && real.trim()) return real.trim();
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd) {
+    // Rightmost entry is the one appended by the nearest trusted proxy.
+    const parts = fwd.split(',');
+    return parts[parts.length - 1].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+};
+
+/** Returns true when the request was rejected with 429. */
+const rateLimited = (req, res, pathname) => {
+  if (!RATE_LIMIT_ENABLED) return false;
+  const group = rateGroupFor(pathname);
+  if (!group) return false;
+  const limit = RATE_LIMITS[group];
+  const key = `${group}:${clientIp(req)}`;
+  const now = Date.now();
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now - bucket.start >= RATE_WINDOW_MS) {
+    bucket = { start: now, count: 0 };
+    rateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  const remaining = Math.max(0, limit - bucket.count);
+  const resetSec = Math.max(1, Math.ceil((bucket.start + RATE_WINDOW_MS - now) / 1000));
+  if (bucket.count > limit) {
+    res.writeHead(429, {
+      'content-type': 'application/json; charset=utf-8',
+      'retry-after': String(resetSec),
+      'x-ratelimit-limit': String(limit),
+      'x-ratelimit-remaining': '0',
+      'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify({ ok: false, status_message: 'Too many requests' }));
+    return true;
+  }
+  res.setHeader('x-ratelimit-limit', String(limit));
+  res.setHeader('x-ratelimit-remaining', String(remaining));
+  return false;
+};
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateBuckets) {
+    if (now - bucket.start >= RATE_WINDOW_MS) rateBuckets.delete(key);
+  }
+}, 60_000).unref();
+
 const serveStatic = (req, res) => {
   const pathOnly = String(req.url || '/').split('?')[0];
   if (pathOnly === '/health') {
@@ -1876,6 +1956,8 @@ const serveStatic = (req, res) => {
     return;
   }
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+  if (rateLimited(req, res, url.pathname)) return;
 
   if (url.pathname.startsWith('/tmdb/') || url.pathname === '/tmdb') {
     void serveTmdb(req, res);
